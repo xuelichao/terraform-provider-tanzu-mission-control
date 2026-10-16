@@ -8,6 +8,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -70,22 +73,14 @@ func readFullClusterResourceWait(ctx context.Context, config *authctx.TanzuConte
 	// Calling again to get updated status
 	resp, _ = readFullClusterResource(config, clusterFn)
 
-	var nodePoolsToCheck []*tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepool
-
-	for _, existingNp := range existingNodePools {
-		for _, clusterNp := range resp.TanzuKubernetesCluster.Spec.Topology.NodePools {
-			if existingNp.FullName.Name == clusterNp.FullName.Name {
-				nodePoolsToCheck = append(nodePoolsToCheck, clusterNp)
-				break
-			}
-		}
-	}
-
-	resp.TanzuKubernetesCluster.Spec.Topology.NodePools = nodePoolsToCheck
-
-	err = waitNodePoolsReady(ctx, config, clusterFn, nodePoolsToCheck)
+	// waitNodePoolsReady actively polls and verifies that all expected node pools exist and reach READY phase.
+	readyNodePools, err := waitNodePoolsReady(ctx, config, clusterFn, existingNodePools)
 	if err != nil {
 		return resp, err
+	}
+
+	if resp != nil && resp.TanzuKubernetesCluster != nil && resp.TanzuKubernetesCluster.Spec != nil && resp.TanzuKubernetesCluster.Spec.Topology != nil {
+		resp.TanzuKubernetesCluster.Spec.Topology.NodePools = readyNodePools
 	}
 
 	if waitForKubeConfig && resp.TanzuKubernetesCluster.Spec.KubeConfig == "" {
@@ -159,75 +154,107 @@ func waitClusterReady(ctx context.Context, config *authctx.TanzuContext, cluster
 	return err
 }
 
-// waitNodePoolsReady waits for Node Pools to be in a stop state.
-func waitNodePoolsReady(ctx context.Context, config *authctx.TanzuContext, clusterFn *tanzukubernetesclustermodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterFullName, nodePoolsToCheck []*tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepool) (err error) {
-	nodePoolsReady := false
+var nodePoolPollInterval = 5 * time.Second
 
-	for !nodePoolsReady {
-		nodePoolsReady = true
+// waitNodePoolsReady waits for all expected Node Pools to be present in the cluster and reach READY phase.
+func waitNodePoolsReady(
+	ctx context.Context,
+	config *authctx.TanzuContext,
+	clusterFn *tanzukubernetesclustermodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterFullName,
+	expectedNodePools []*tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepool,
+) ([]*tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepool, error) {
+	if len(expectedNodePools) == 0 {
+		return nil, nil
+	}
 
-		for _, np := range nodePoolsToCheck {
-			nodePoolStatus := *np.Status.Phase
+	npStatusMap := make(map[string]string)
 
-			switch nodePoolStatus {
-			case tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepoolStatusPhaseREADY:
-			case tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepoolStatusPhaseERROR:
-				err = errors.Errorf("TKG Cluster node pool errored.\nManagement Cluster Name: %s, Provisioner: %s, Cluster Name: %s, Node Pool Name: %s",
-					clusterFn.ManagementClusterName, clusterFn.ProvisionerName, clusterFn.Name, np.FullName.Name)
+	for {
+		nodePoolsResp, err := config.TMCConnection.TanzuKubernetesClusterResourceService.TanzuKubernetesClusterNodePoolResourceServiceList(clusterFn)
+		if clienterrors.IsUnauthorizedError(err) {
+			authctx.RefreshUserAuthContext(config, clienterrors.IsUnauthorizedError, err)
+		} else if err != nil {
+			log.Printf("[DEBUG] Failed to list node pools for cluster '%s': %v", clusterFn.Name, err)
+		} else {
+			allReady := true
+			var matchedPools []*tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepool
 
-				return err
-			case tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepoolStatusPhaseUPGRADEFAILED:
-				err = errors.Errorf("TKG Cluster node pool upgrade failed.\nManagement Cluster Name: %s, Provisioner: %s, Cluster Name: %s, Node Pool Name: %s",
-					clusterFn.ManagementClusterName, clusterFn.ProvisionerName, clusterFn.Name, np.FullName.Name)
-
-				return err
-			default:
-				nodePoolsReady = false
-			}
-		}
-
-		if !nodePoolsReady {
-			time.Sleep(5 * time.Second)
-
-			err := ctx.Err()
-			if err != nil {
-				if errors.Is(err, context.DeadlineExceeded) {
-					errMsg := "Timeout exceeded while waiting for the cluster node pools to be ready."
-
-					for _, np := range nodePoolsToCheck {
-						npStatusMsg := fmt.Sprintf("Node pool '%s' is in status %s", np.FullName.Name, *np.Status.Phase)
-						errMsg = fmt.Sprintf("%s\n%s", errMsg, npStatusMsg)
-					}
-
-					err = errors.Wrapf(err, "%s", errMsg)
+			for _, expectedNp := range expectedNodePools {
+				expectedName := ""
+				if expectedNp.FullName != nil {
+					expectedName = expectedNp.FullName.Name
+				}
+				if expectedName == "" {
+					continue
 				}
 
-				return err
-			}
+				var foundNp *tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepool
 
-			nodePoolsResp, err := config.TMCConnection.TanzuKubernetesClusterResourceService.TanzuKubernetesClusterNodePoolResourceServiceList(clusterFn)
-
-			if clienterrors.IsUnauthorizedError(err) {
-				authctx.RefreshUserAuthContext(config, clienterrors.IsUnauthorizedError, err)
-			} else {
-				if err != nil {
-					return err
-				}
-
-				for i, np := range nodePoolsToCheck {
+				if nodePoolsResp != nil {
 					for _, respNp := range nodePoolsResp.Nodepools {
-						if np.FullName.Name == respNp.FullName.Name {
-							nodePoolsToCheck[i] = respNp
-
+						if respNp.FullName != nil && respNp.FullName.Name == expectedName {
+							foundNp = respNp
 							break
 						}
 					}
 				}
+
+				if foundNp == nil {
+					allReady = false
+					npStatusMap[expectedName] = "not found in cluster"
+					continue
+				}
+
+				if foundNp.Status == nil || foundNp.Status.Phase == nil {
+					allReady = false
+					npStatusMap[expectedName] = "initializing"
+					continue
+				}
+
+				nodePoolStatus := *foundNp.Status.Phase
+				npStatusMap[expectedName] = string(nodePoolStatus)
+
+				switch nodePoolStatus {
+				case tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepoolStatusPhaseREADY:
+					matchedPools = append(matchedPools, foundNp)
+				case tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepoolStatusPhaseERROR:
+					return nil, errors.Errorf("TKG Cluster node pool errored.\nManagement Cluster Name: %s, Provisioner: %s, Cluster Name: %s, Node Pool Name: %s",
+						clusterFn.ManagementClusterName, clusterFn.ProvisionerName, clusterFn.Name, expectedName)
+				case tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepoolStatusPhaseUPGRADEFAILED:
+					return nil, errors.Errorf("TKG Cluster node pool upgrade failed.\nManagement Cluster Name: %s, Provisioner: %s, Cluster Name: %s, Node Pool Name: %s",
+						clusterFn.ManagementClusterName, clusterFn.ProvisionerName, clusterFn.Name, expectedName)
+				default:
+					allReady = false
+				}
+			}
+
+			if allReady && len(matchedPools) == len(expectedNodePools) {
+				return matchedPools, nil
 			}
 		}
-	}
 
-	return err
+		select {
+		case <-ctx.Done():
+			ctxErr := ctx.Err()
+			if errors.Is(ctxErr, context.DeadlineExceeded) {
+				errMsg := "Timeout exceeded while waiting for the cluster node pools to be ready."
+				for _, expectedNp := range expectedNodePools {
+					expectedName := ""
+					if expectedNp.FullName != nil {
+						expectedName = expectedNp.FullName.Name
+					}
+					status, exists := npStatusMap[expectedName]
+					if !exists {
+						status = "not found in cluster"
+					}
+					errMsg = fmt.Sprintf("%s\nNode pool '%s' is in status: %s", errMsg, expectedName, status)
+				}
+				return nil, errors.Wrapf(ctxErr, "%s", errMsg)
+			}
+			return nil, ctxErr
+		case <-time.After(nodePoolPollInterval):
+		}
+	}
 }
 
 // waitKubeConfigReady waits for the KubeConfig to be in a stop state and returns it.
@@ -527,4 +554,353 @@ func suppressNodePoolsOrderChanges(oldNodePoolsArray []interface{}, data *schema
 	topologyData[NodePoolKey] = orderedNodePoolsArray
 
 	_ = data.Set(SpecKey, []interface{}{specData})
+}
+
+// isRetryableNodePoolError checks if the error from node pool create/update/delete is a transient or retryable condition.
+func isRetryableNodePoolError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := strings.ToLower(err.Error())
+
+	// 1. Webhook admission rejection due to pending SystemChecks or transient validation
+	if strings.Contains(errMsg, "systemcheckssucceeded") ||
+		strings.Contains(errMsg, "update cannot be initiated") ||
+		strings.Contains(errMsg, "admission webhook") {
+		return true
+	}
+
+	// 2. Race condition on cluster initialization or nodepool labels
+	if strings.Contains(errMsg, "duplicate") ||
+		strings.Contains(errMsg, "nodepoollabels") ||
+		strings.Contains(errMsg, "being initialized") {
+		return true
+	}
+
+	// 3. Optimistic locking / Kubernetes resource version conflicts
+	if strings.Contains(errMsg, "the object has been modified") ||
+		strings.Contains(errMsg, "conflict") ||
+		strings.Contains(errMsg, "resourceversion") {
+		return true
+	}
+
+	// 4. Transient network / RPC / gateway issues
+	if strings.Contains(errMsg, "eof") ||
+		strings.Contains(errMsg, "connection reset") ||
+		strings.Contains(errMsg, "connection refused") ||
+		strings.Contains(errMsg, "transport is closing") ||
+		strings.Contains(errMsg, "unavailable") ||
+		strings.Contains(errMsg, "broken pipe") ||
+		strings.Contains(errMsg, "deadline exceeded") {
+		return true
+	}
+
+	// 5. Rate limiting (HTTP 429 / gRPC Code 8 ResourceExhausted)
+	if strings.Contains(errMsg, "status : 429") ||
+		strings.Contains(errMsg, "too many requests") ||
+		strings.Contains(errMsg, "rate limit") ||
+		strings.Contains(errMsg, "rate limiting") ||
+		strings.Contains(errMsg, "resourceexhausted") ||
+		strings.Contains(errMsg, "\"code\":8") ||
+		strings.Contains(errMsg, "code = resourceexhausted") {
+		return true
+	}
+
+	// 6. Transient 5xx server errors
+	if strings.Contains(errMsg, "status : 500") ||
+		strings.Contains(errMsg, "status : 502") ||
+		strings.Contains(errMsg, "status : 503") ||
+		strings.Contains(errMsg, "status : 504") {
+		return true
+	}
+
+	return false
+}
+
+var (
+	nodePoolInitialBackoff = 5 * time.Second
+	nodePoolMaxBackoff     = 60 * time.Second
+	nodePoolBackoffFactor  = 1.5
+	nodePoolJitterFactor   = 0.2 // +/-20% random jitter
+)
+
+// calculateBackoffWithJitter returns the duration to sleep for the current backoff interval
+// and the next backoff interval to use for subsequent retries, applying exponential backoff and randomized jitter.
+func calculateBackoffWithJitter(currentBackoff, maxBackoff time.Duration, factor, jitterRatio float64) (time.Duration, time.Duration) {
+	if currentBackoff <= 0 {
+		currentBackoff = nodePoolInitialBackoff
+	}
+	if maxBackoff <= 0 {
+		maxBackoff = nodePoolMaxBackoff
+	}
+	if factor <= 1.0 {
+		factor = nodePoolBackoffFactor
+	}
+	if jitterRatio < 0 || jitterRatio > 1.0 {
+		jitterRatio = nodePoolJitterFactor
+	}
+
+	// Apply jitter in range [1 - jitterRatio, 1 + jitterRatio]
+	jitter := 1.0 + (rand.Float64()*2.0-1.0)*jitterRatio
+	sleepDuration := time.Duration(float64(currentBackoff) * jitter)
+	if sleepDuration > maxBackoff {
+		sleepDuration = maxBackoff
+	}
+	if sleepDuration < 0 {
+		sleepDuration = currentBackoff
+	}
+
+	nextBackoff := time.Duration(float64(currentBackoff) * factor)
+	if nextBackoff > maxBackoff {
+		nextBackoff = maxBackoff
+	}
+
+	return sleepDuration, nextBackoff
+}
+
+// createNodePoolWithRetry creates a node pool with polling retry and exponential backoff with jitter, handling transient errors like webhook rejections.
+func createNodePoolWithRetry(
+	ctx context.Context,
+	config *authctx.TanzuContext,
+	nodePoolRequest *tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepoolData,
+	timeout time.Duration,
+) error {
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	currentBackoff := nodePoolInitialBackoff
+	attempt := 0
+
+	for {
+		attempt++
+		_, err := config.TMCConnection.TanzuKubernetesClusterResourceService.TanzuKubernetesClusterNodePoolResourceServiceCreate(nodePoolRequest)
+		if err == nil {
+			return nil
+		}
+
+		// Idempotency: if already exists, verify whether nodepool is really present
+		if clienterrors.IsAlreadyExistsError(err) || strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			_, getErr := config.TMCConnection.TanzuKubernetesClusterResourceService.TanzuKubernetesClusterNodePoolResourceServiceGet(nodePoolRequest.Nodepool.FullName)
+			if getErr == nil {
+				return nil
+			}
+		}
+
+		if !isRetryableNodePoolError(err) {
+			return err
+		}
+
+		sleepDuration, next := calculateBackoffWithJitter(currentBackoff, nodePoolMaxBackoff, nodePoolBackoffFactor, nodePoolJitterFactor)
+		currentBackoff = next
+
+		log.Printf("[DEBUG] Retrying creation for node pool '%s' (attempt %d) in %v due to transient error: %s",
+			nodePoolRequest.Nodepool.FullName.Name, attempt, sleepDuration, err.Error())
+
+		select {
+		case <-ctx.Done():
+			return errors.Wrapf(ctx.Err(), "timed out waiting for nodepool '%s' creation to be accepted after %d attempts. Last error: %s",
+				nodePoolRequest.Nodepool.FullName.Name, attempt, err.Error())
+		case <-time.After(sleepDuration):
+		}
+	}
+}
+
+// updateNodePoolWithRetry updates a node pool with polling retry and exponential backoff with jitter, handling transient errors like webhook rejections.
+func updateNodePoolWithRetry(
+	ctx context.Context,
+	config *authctx.TanzuContext,
+	nodePoolRequest *tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepoolData,
+	timeout time.Duration,
+) error {
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	currentBackoff := nodePoolInitialBackoff
+	attempt := 0
+
+	for {
+		attempt++
+		_, err := config.TMCConnection.TanzuKubernetesClusterResourceService.TanzuKubernetesClusterNodePoolResourceServiceUpdate(nodePoolRequest)
+		if err == nil {
+			return nil
+		}
+
+		if !isRetryableNodePoolError(err) {
+			return err
+		}
+
+		sleepDuration, next := calculateBackoffWithJitter(currentBackoff, nodePoolMaxBackoff, nodePoolBackoffFactor, nodePoolJitterFactor)
+		currentBackoff = next
+
+		log.Printf("[DEBUG] Retrying update for node pool '%s' (attempt %d) in %v due to transient error: %s",
+			nodePoolRequest.Nodepool.FullName.Name, attempt, sleepDuration, err.Error())
+
+		select {
+		case <-ctx.Done():
+			return errors.Wrapf(ctx.Err(), "timed out waiting for nodepool '%s' update to be accepted after %d attempts. Last error: %s",
+				nodePoolRequest.Nodepool.FullName.Name, attempt, err.Error())
+		case <-time.After(sleepDuration):
+		}
+	}
+}
+
+// deleteNodePoolWithRetry deletes a node pool with polling retry and exponential backoff with jitter.
+func deleteNodePoolWithRetry(
+	ctx context.Context,
+	config *authctx.TanzuContext,
+	nodePoolFn *tkcnodepoolmodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterNodepoolFullName,
+	timeout time.Duration,
+) error {
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	currentBackoff := nodePoolInitialBackoff
+	attempt := 0
+
+	for {
+		attempt++
+		err := config.TMCConnection.TanzuKubernetesClusterResourceService.TanzuKubernetesClusterNodePoolResourceServiceDelete(nodePoolFn)
+		if err == nil || clienterrors.IsNotFoundError(err) {
+			return nil
+		}
+
+		if !isRetryableNodePoolError(err) {
+			return err
+		}
+
+		sleepDuration, next := calculateBackoffWithJitter(currentBackoff, nodePoolMaxBackoff, nodePoolBackoffFactor, nodePoolJitterFactor)
+		currentBackoff = next
+
+		log.Printf("[DEBUG] Retrying deletion for node pool '%s' (attempt %d) in %v due to transient error: %s",
+			nodePoolFn.Name, attempt, sleepDuration, err.Error())
+
+		select {
+		case <-ctx.Done():
+			return errors.Wrapf(ctx.Err(), "timed out waiting for nodepool '%s' deletion to be accepted after %d attempts. Last error: %s",
+				nodePoolFn.Name, attempt, err.Error())
+		case <-time.After(sleepDuration):
+		}
+	}
+}
+
+// isRetryableClusterError determines if a cluster creation error is transient and can be retried.
+func isRetryableClusterError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := strings.ToLower(err.Error())
+
+	// 1. Rate limiting (HTTP 429 / gRPC Code 8 ResourceExhausted)
+	if strings.Contains(errMsg, "status : 429") ||
+		strings.Contains(errMsg, "too many requests") ||
+		strings.Contains(errMsg, "rate limit") ||
+		strings.Contains(errMsg, "rate limiting") ||
+		strings.Contains(errMsg, "resourceexhausted") ||
+		strings.Contains(errMsg, "\"code\":8") ||
+		strings.Contains(errMsg, "code = resourceexhausted") {
+		return true
+	}
+
+	// 2. Conflict when an old cluster is still deleting or terminating in background
+	if clienterrors.IsAlreadyExistsError(err) ||
+		strings.Contains(errMsg, "already exists") ||
+		strings.Contains(errMsg, "status : 409") ||
+		strings.Contains(errMsg, "conflict") {
+		return true
+	}
+
+	// 3. Transient network / RPC / gateway issues
+	if strings.Contains(errMsg, "eof") ||
+		strings.Contains(errMsg, "connection reset") ||
+		strings.Contains(errMsg, "connection refused") ||
+		strings.Contains(errMsg, "transport is closing") ||
+		strings.Contains(errMsg, "unavailable") ||
+		strings.Contains(errMsg, "broken pipe") ||
+		strings.Contains(errMsg, "deadline exceeded") {
+		return true
+	}
+
+	// 4. Transient 5xx server errors
+	if strings.Contains(errMsg, "status : 500") ||
+		strings.Contains(errMsg, "status : 502") ||
+		strings.Contains(errMsg, "status : 503") ||
+		strings.Contains(errMsg, "status : 504") {
+		return true
+	}
+
+	return false
+}
+
+// createClusterWithRetry creates a Tanzu Kubernetes Cluster with polling retry and exponential backoff with jitter.
+// It handles rate limiting (429) and lingering background cluster deletions (409 conflict).
+func createClusterWithRetry(
+	ctx context.Context,
+	config *authctx.TanzuContext,
+	clusterRequest *tanzukubernetesclustermodels.VmwareTanzuManageV1alpha1ManagementClusterProvisionerTanzukubernetesClusterData,
+	timeout time.Duration,
+) error {
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	currentBackoff := nodePoolInitialBackoff
+	attempt := 0
+	clusterFn := clusterRequest.TanzuKubernetesCluster.FullName
+
+	for {
+		attempt++
+		_, err := config.TMCConnection.TanzuKubernetesClusterResourceService.TanzuKubernetesClusterResourceServiceCreate(clusterRequest)
+		if err == nil {
+			return nil
+		}
+
+		// Idempotency / lingering deletion handling on 409 Conflict
+		if clienterrors.IsAlreadyExistsError(err) || strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			existingCluster, getErr := config.TMCConnection.TanzuKubernetesClusterResourceService.TanzuKubernetesClusterResourceServiceGet(clusterFn)
+			if getErr == nil && existingCluster != nil && existingCluster.TanzuKubernetesCluster != nil {
+				tkc := existingCluster.TanzuKubernetesCluster
+				if tkc.Status != nil && tkc.Status.Phase != nil {
+					phase := *tkc.Status.Phase
+					// If the existing cluster is actively DELETING, wait for it to be fully removed
+					if phase == tanzukubernetesclustermodels.VmwareTanzuManageV1alpha1CommonClusterStatusPhaseDELETING {
+						log.Printf("[DEBUG] Cluster '%s' currently in DELETING phase, waiting for removal before recreation...", clusterFn.Name)
+					} else {
+						// Existing cluster is present and not deleting, idempotent success
+						log.Printf("[INFO] Cluster '%s' already exists in phase '%s', proceeding idempotently", clusterFn.Name, phase)
+						return nil
+					}
+				} else {
+					return nil
+				}
+			}
+		}
+
+		if !isRetryableClusterError(err) {
+			return err
+		}
+
+		sleepDuration, next := calculateBackoffWithJitter(currentBackoff, nodePoolMaxBackoff, nodePoolBackoffFactor, nodePoolJitterFactor)
+		currentBackoff = next
+
+		log.Printf("[DEBUG] Retrying creation for cluster '%s' (attempt %d) in %v due to transient/conflict error: %s",
+			clusterFn.Name, attempt, sleepDuration, err.Error())
+
+		select {
+		case <-ctx.Done():
+			return errors.Wrapf(ctx.Err(), "timed out waiting for cluster '%s' creation to be accepted after %d attempts. Last error: %s",
+				clusterFn.Name, attempt, err.Error())
+		case <-time.After(sleepDuration):
+		}
+	}
 }
